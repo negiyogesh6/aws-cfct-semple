@@ -1,0 +1,164 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Budget Alert with Multiple Notifications and Email Recipients
+
+Parameters:
+  BudgetAmount:
+    Type: Number
+    Description: Monthly budget amount in USD
+    Default: 1000
+    MinValue: 1
+
+  NotificationThresholds:
+    Type: String
+    Description: Comma-separated list of threshold percentages (e.g., 80,90,100)
+    Default: "80,100"
+
+  EmailAddresses:
+    Type: String
+    Description: Comma-separated list of email addresses
+
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BudgetAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - budgets:CreateBudget
+                  - budgets:DeleteBudget
+                  - budgets:DescribeBudget
+                  - budgets:CreateNotification
+                  - budgets:DeleteNotification
+                  - budgets:DescribeNotificationsForBudget
+                  - budgets:CreateSubscriber
+                  - budgets:DeleteSubscriber
+                  - budgets:DescribeSubscribersForNotification
+                  - budgets:ModifyBudget
+                Resource: !Sub 'arn:aws:budgets::${AWS::AccountId}:*'
+
+  BudgetFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      budget_client = boto3.client('budgets')
+                      props = event['ResourceProperties']
+                      
+                      budget_name = props['BudgetName']
+                      amount = str(props['BudgetAmount'])
+                      thresholds = [float(t.strip()) for t in props['Thresholds'].split(',')]
+                      emails = [e.strip() for e in props['Emails'].split(',')]
+                      
+                      budget = {
+                          'BudgetName': budget_name,
+                          'BudgetLimit': {
+                              'Amount': amount,
+                              'Unit': 'USD'
+                          },
+                          'TimeUnit': 'MONTHLY',
+                          'BudgetType': 'COST',
+                          'CostTypes': {
+                              'IncludeCredit': False,
+                              'IncludeDiscount': True,
+                              'IncludeOtherSubscription': True,
+                              'IncludeRecurring': True,
+                              'IncludeRefund': False,
+                              'IncludeSubscription': True,
+                              'IncludeSupport': True,
+                              'IncludeTax': True,
+                              'IncludeUpfront': True,
+                              'UseAmortized': False,
+                              'UseBlended': False
+                          }
+                      }
+                      
+                      notifications = []
+                      for threshold in thresholds:
+                          notification = {
+                              'Notification': {
+                                  'NotificationType': 'ACTUAL',
+                                  'ComparisonOperator': 'GREATER_THAN',
+                                  'Threshold': threshold,
+                                  'ThresholdType': 'PERCENTAGE'
+                              },
+                              'Subscribers': [
+                                  {'SubscriptionType': 'EMAIL', 'Address': email}
+                                  for email in emails
+                              ]
+                          }
+                          notifications.append(notification)
+                      
+                      try:
+                          budget_client.delete_budget(
+                              AccountId=context.invoked_function_arn.split(':')[4],
+                              BudgetName=budget_name
+                          )
+                      except Exception as e:
+                          print(f"No existing budget to delete: {str(e)}")
+                      
+                      budget_client.create_budget(
+                          AccountId=context.invoked_function_arn.split(':')[4],
+                          Budget=budget,
+                          NotificationsWithSubscribers=notifications
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'Message': 'Budget created/updated successfully'
+                      })
+                  
+                  elif event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'Message': 'Budget will be deleted'
+                      })
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+
+  BudgetSetup:
+    Type: Custom::Budget
+    DependsOn: BudgetFunction
+    Properties:
+      ServiceToken: !GetAtt BudgetFunction.Arn
+      BudgetName: !Sub ${AWS::StackName}-budget
+      BudgetAmount: !Ref BudgetAmount
+      Thresholds: !Ref NotificationThresholds
+      Emails: !Ref EmailAddresses
+
+Outputs:
+  BudgetName:
+    Description: Name of the created budget
+    Value: !Sub ${AWS::StackName}-budget
+  BudgetAmount:
+    Description: Budget Amount
+    Value: !Ref BudgetAmount
+  NotificationThresholds:
+    Description: Alert Thresholds
+    Value: !Ref NotificationThresholds
+  EmailRecipients:
+    Description: Email Recipients
+    Value: !Ref EmailAddresses

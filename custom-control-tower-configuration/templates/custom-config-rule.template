@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Resources:
+  # IAM Role for Lambda function with permissions to revoke security group rules and put evaluations to AWS Config
+  CustomSecurityGroupRemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SecurityGroupRemediationRole
+      Description: Role for Lambda function to revoke security group rules and put evaluations to AWS Config
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: CustomSecurityGroupRemediationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:RevokeSecurityGroupIngress
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - config:PutEvaluations
+                Resource: '*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Lambda function to check and remove public access rules in EC2 Security Groups
+  CustomSecurityGroupRemediationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CustomSecurityGroupRemediationRole.Arn
+      FunctionName: CustomSecurityGroupRemediationFunction
+      Runtime: python3.8
+      Timeout: 30  # Timeout in seconds for Lambda function
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def lambda_handler(event, context):
+              ec2 = boto3.client('ec2')
+              config_client = boto3.client('config')  # Initialize AWS Config client
+
+              # Safely load the 'invokingEvent' from the event payload
+              try:
+                  invoking_event = json.loads(event.get('invokingEvent', '{}'))
+              except json.JSONDecodeError:
+                  invoking_event = {}
+
+              # Extract the configurationItem if available
+              configuration_item = invoking_event.get('configurationItem', {})
+
+              # Get security groups and check for public rules
+              security_groups = ec2.describe_security_groups()['SecurityGroups']
+              insecure_sgs = []
+
+              # Loop through each security group and its inbound rules
+              for sg in security_groups:
+                  for permission in sg['IpPermissions']:
+                      for ip_range in permission.get('IpRanges', []):
+                          if ip_range['CidrIp'] == '0.0.0.0/0' and not (permission.get('FromPort') == 3299 or permission.get('ToPort') == 3299):
+
+                              if permission['IpProtocol'] == '-1':
+                                  insecure_sgs.append(sg['GroupId'])
+                                  try:
+                                      ec2.revoke_security_group_ingress(
+                                          GroupId=sg['GroupId'],
+                                          IpProtocol='-1',
+                                          CidrIp='0.0.0.0/0'
+                                      )
+                                      print(f"Removed all traffic rule from security group {sg['GroupId']}")
+                                  except Exception as e:
+                                      print(f"Error removing rule for security group {sg['GroupId']}: {e}")
+                              else:
+                                  insecure_sgs.append(sg['GroupId'])
+                                  try:
+                                      ec2.revoke_security_group_ingress(
+                                          GroupId=sg['GroupId'],
+                                          IpProtocol=permission['IpProtocol'],
+                                          FromPort=permission.get('FromPort'),
+                                          ToPort=permission.get('ToPort'),
+                                          CidrIp='0.0.0.0/0'
+                                      )
+                                      print(f"Removed specific rule for security group {sg['GroupId']}")
+                                  except Exception as e:
+                                      print(f"Error removing rule for security group {sg['GroupId']}: {e}")
+
+              # Prepare compliance evaluations
+              evaluations = []  # List to store evaluation objects
+
+              # Report NON_COMPLIANT for each insecure security group
+              for sg_id in insecure_sgs:
+                  evaluations.append({
+                      'ComplianceResourceType': 'AWS::EC2::SecurityGroup',
+                      'ComplianceResourceId': sg_id,
+                      'ComplianceType': 'NON_COMPLIANT',
+                      'Annotation': 'Public rule allowing 0.0.0.0/0 detected and removed.',
+                      'OrderingTimestamp': configuration_item.get('configurationItemCaptureTime', None)
+                  })
+
+              # If no insecure security groups were found, report them as compliant
+              if not insecure_sgs:
+                  for sg in security_groups:
+                      sg_id = sg['GroupId']
+                      evaluations.append({
+                          'ComplianceResourceType': 'AWS::EC2::SecurityGroup',
+                          'ComplianceResourceId': sg_id,
+                          'ComplianceType': 'COMPLIANT',
+                          'Annotation': 'No public rules found.',
+                          'OrderingTimestamp': configuration_item.get('configurationItemCaptureTime', None)
+                      })
+
+              # Send the evaluations to AWS Config
+              if evaluations:
+                  config_client.put_evaluations(
+                      Evaluations=evaluations,
+                      ResultToken=event['resultToken']
+                  )
+
+              # Return the result based on whether insecure security groups were found
+              if insecure_sgs:
+                  return {
+                      'statusCode': 200,
+                      'body': f'Removed access from 0.0.0.0/0 in the following security groups: {insecure_sgs}'
+                  }
+              else:
+                  return {
+                      'statusCode': 200,
+                      'body': 'No security groups had access from 0.0.0.0/0.'
+                  }
+
+  # Lambda permission to allow AWS Config to invoke the Lambda function
+  CustomSecurityGroupRemediationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CustomSecurityGroupRemediationFunction
+      Principal: config.amazonaws.com
+    DependsOn: CustomSecurityGroupRemediationFunction
+
+  # Custom AWS Config Rule to check for public access in EC2 Security Groups
+  CustomSecurityGroupConfigRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: CustomConfigRule-security-group-public-access-deny
+      Description: "Checks for security groups with public access (0.0.0.0/0)."
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::SecurityGroup
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ConfigurationItemChangeNotification
+        SourceIdentifier:
+          Fn::GetAtt:
+            - CustomSecurityGroupRemediationFunction
+            - Arn    
+
+    DependsOn: CustomSecurityGroupRemediationFunction

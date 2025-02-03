@@ -1,0 +1,50 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "ProtectManagementAccount",
+        "Effect": "Deny",
+        "Action": [
+          "organizations:LeaveOrganization",
+          "organizations:CloseAccount",
+          "organizations:DeleteOrganization"
+        ],
+        "Resource": "*",
+        "Condition": {
+          "StringNotLike": {
+            "aws:PrincipalARN": [
+              "arn:aws:iam::*:role/AWSControlTowerAdmin",
+              "arn:aws:iam::*:role/aws-reserved/sso.amazonaws.com/*/AWSReservedSSO_AWSAdministratorAccess_*"
+            ]
+          }
+        }
+      },
+      {
+        "Sid": "DenyMemberAccountInstances",
+        "Effect": "Deny",
+        "Action": [
+          "sso:CreateInstance"
+        ],
+        "Resource": "*"
+      },
+      {
+        "Sid": "DenyAllOutsideAllowedregions",
+        "Effect": "Deny",
+        "NotAction": [
+          "cloudfront:*",
+          "iam:*",
+          "route53:*",
+          "support:*"
+        ],
+        "Resource": "*",
+        "Condition": {
+          "StringNotEquals": {
+            "aws:RequestedRegion": [
+              "ap-southeast-1",
+              "us-east-1"
+            ]
+          }
+        }
+      }
+    ]
+  }

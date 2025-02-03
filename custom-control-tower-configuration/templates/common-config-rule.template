@@ -1,0 +1,337 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  EmailAddresses:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of email addresses to receive non-compliant
+      resource notifications
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Notification Configuration
+        Parameters:
+          - EmailAddresses
+
+Resources:
+  NonCompliantResourcesSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub CommonConfigRule-NonCompliantResources
+      DisplayName: Non-Compliant Resource Notifications
+
+  NonCompliantResourcesEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub CommonConfigRule-ConfigComplianceRule
+      Description: Monitors AWS Config compliance changes and sends notifications
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+        detail:
+          newEvaluationResult:
+            complianceType:
+              - NON_COMPLIANT
+      Targets:
+        - Arn: !Ref NonCompliantResourcesSNSTopic
+          Id: !Sub CommonConfigRule-Target
+          InputTransformer:
+            InputPathsMap:
+              resourceId: $.detail.resourceId
+              complianceType: $.detail.newEvaluationResult.complianceType
+              ruleName: $.detail.configRuleName
+              resourceType: $.detail.resourceType
+              accountId: $.account
+              region: $.region
+            InputTemplate: |
+              {
+               "message": "Following Resource is NON_COMPLIANT with AWS Config Rule. Please investigate and remediate.",
+               "details": {
+                 "Config Rule":   "<ruleName>",
+                 "Resource Type": "<resourceType>",
+                 "Resource ID":   "<resourceId>",
+                 "AWS Region":    "<region>",
+                 "AWS Account ID": "<accountId>"
+               }
+              }
+
+  CloudWatchEventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub CommonConfigRuleSet-EventsRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub CommonConfigRuleSet-EventsSNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NonCompliantResourcesSNSTopic
+
+  NonCompliantResourcesSNSPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref NonCompliantResourcesSNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref NonCompliantResourcesSNSTopic
+
+  EmailSubscriptionsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      sns = boto3.client('sns')
+                      topic_arn = event['ResourceProperties']['TopicArn']
+                      emails = event['ResourceProperties']['Emails']
+                      for email in emails:
+                          if email.strip():
+                              sns.subscribe(
+                                  TopicArn=topic_arn,
+                                  Protocol='email',
+                                  Endpoint=email.strip()
+                              )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSSubscribe
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Subscribe
+                Resource: !Ref NonCompliantResourcesSNSTopic
+
+  EmailSubscriptions:
+    Type: Custom::SNSSubscriptions
+    Properties:
+      ServiceToken: !GetAtt EmailSubscriptionsFunction.Arn
+      TopicArn: !Ref NonCompliantResourcesSNSTopic
+      Emails: !Ref EmailAddresses
+  # Add this section under Resources:
+
+  # EC2 and EBS Related Rules
+  EC2VolumeInUseCheck:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: !Sub CommonConfigRule-volume-in-use
+      Description: Checks if EBS volumes are attached to EC2 instances
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_VOLUME_INUSE_CHECK
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Volume
+
+  EC2VolumeEncryptionCheck:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: !Sub CommonConfigRule-volume-encryption
+      Description: Checks if EBS volumes are encrypted
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_EBS_ENCRYPTION_BY_DEFAULT
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Volume
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  EC2PublicIPCheck:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: !Sub CommonConfigRule-no-public-ip
+      Description: Checks if EC2 instances have public IPs
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_INSTANCE_NO_PUBLIC_IP
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+
+  EBSVolumeEncryptionByDefault:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: !Sub CommonConfigRule-ebs-encryption-default
+      Description: Checks if EBS encryption by default is enabled
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_EBS_ENCRYPTION_BY_DEFAULT
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  # Storage Related Rules
+  EFSEncryptedCheck:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: !Sub CommonConfigRule-efs-encrypted
+      Description: Checks if EFS systems are encrypted
+      Source:
+        Owner: AWS
+        SourceIdentifier: EFS_ENCRYPTED_CHECK
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EFS::FileSystem
+
+  S3PublicReadCheck:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: !Sub CommonConfigRule-s3-public-read
+      Description: Checks if S3 buckets allow public read access
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_LEVEL_PUBLIC_ACCESS_PROHIBITED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+
+  S3PublicWriteCheck:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: !Sub CommonConfigRule-s3-public-write
+      Description: Checks if S3 buckets allow public write access
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_WRITE_PROHIBITED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+
+  # Security Related Rules
+  RestrictedSSHCheck:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: !Sub CommonConfigRule-restricted-ssh
+      Description: Checks for unrestricted SSH access
+      Source:
+        Owner: AWS
+        SourceIdentifier: INCOMING_SSH_DISABLED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::SecurityGroup
+
+  EC2SecurityGroupAttachedToENICheck:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: !Sub CommonConfigRule-sg-eni-attached
+      Description: Checks if security groups are attached to ENIs
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_SECURITY_GROUP_ATTACHED_TO_ENI
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::SecurityGroup
+          - AWS::EC2::NetworkInterface
+
+  VPCFlowLogsCheck:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: !Sub CommonConfigRule-vpc-flow-logs
+      Description: Checks if VPC Flow Logs are enabled
+      Source:
+        Owner: AWS
+        SourceIdentifier: VPC_FLOW_LOGS_ENABLED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::VPC
+
+  VPCDefaultSecurityGroupClosed:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: !Sub CommonConfigRule-vpc-default-sg-closed
+      Description: Checks if default security groups restrict all traffic
+      Source:
+        Owner: AWS
+        SourceIdentifier: VPC_DEFAULT_SECURITY_GROUP_CLOSED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::SecurityGroup
+
+  SSMAutomationExecution:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: !Sub CommonConfigRule-ssm-patch-compliance
+      Description: Checks if instances are patch compliant via SSM
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_INSTANCE_MANAGED_BY_SSM
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+
+  AccessKeysRotated:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: !Sub CommonConfigRule-access-keys-rotated
+      Description: Checks if IAM access keys are rotated as per policy
+      Source:
+        Owner: AWS
+        SourceIdentifier: ACCESS_KEYS_ROTATED
+      MaximumExecutionFrequency: TwentyFour_Hours
+      InputParameters:
+        maxAccessKeyAge: 90
+
+Outputs:
+  ConfigRules:
+    Description: List of Config Rules created
+    Value: !Join
+      - ','
+      - - !Ref VPCFlowLogsCheck
+        - !Ref VPCDefaultSecurityGroupClosed
+        - !Ref SSMAutomationExecution
+        - !Ref AccessKeysRotated
+        - !Ref EC2VolumeInUseCheck
+        - !Ref EC2VolumeEncryptionCheck
+        - !Ref EC2PublicIPCheck
+        - !Ref EBSVolumeEncryptionByDefault
+        - !Ref EFSEncryptedCheck
+        - !Ref S3PublicReadCheck
+        - !Ref S3PublicWriteCheck
+        - !Ref RestrictedSSHCheck
+        - !Ref EC2SecurityGroupAttachedToENICheck
+
+  SNSTopicArn:
+    Description: ARN of the SNS Topic for non-compliant resources
+    Value: !Ref NonCompliantResourcesSNSTopic
+
+  EventRuleArn:
+    Description: ARN of the EventBridge Rule
+    Value: !GetAtt NonCompliantResourcesEventRule.Arn

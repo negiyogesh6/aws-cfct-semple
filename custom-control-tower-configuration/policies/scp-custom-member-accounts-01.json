@@ -1,0 +1,67 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "PreventPublicAccess",
+        "Effect": "Deny",
+        "Action": [
+          "s3:PutBucketPublicAccessBlock",
+          "s3:PutAccountPublicAccessBlock"
+        ],
+        "Resource": "*"
+      },
+      {
+        "Sid": "PreventPublicS3",
+        "Effect": "Deny",
+        "Action": "s3:PutBucketAcl",
+        "Resource": "*",
+        "Condition": {
+          "StringEquals": {
+            "s3:x-amz-acl": [
+              "public-read",
+              "public-read-write"
+            ]
+          }
+        }
+      },
+      {
+        "Sid": "ProtectNetworkConfiguration",
+        "Effect": "Deny",
+        "Action": [
+          "ec2:CreateVpc",
+          "ec2:DeleteVpc",
+          "ec2:CreateSubnet",
+          "ec2:DeleteSubnet",
+          "ec2:CreateRouteTable",
+          "ec2:DeleteRouteTable",
+          "ec2:CreateInternetGateway",
+          "ec2:DeleteInternetGateway",
+          "ec2:AttachInternetGateway",
+          "ec2:DetachInternetGateway",
+          "ec2:CreateVpcPeeringConnection",
+          "ec2:DeleteVpcPeeringConnection",
+          "ec2:CreateNatGateway",
+          "ec2:DeleteNatGateway"
+        ],
+        "Resource": "*",
+        "Condition": {
+          "StringNotLike": {
+            "aws:PrincipalARN": [
+              "arn:aws:iam::*:role/NetworkAdmin",
+              "arn:aws:iam::*:role/aws-reserved/sso.amazonaws.com/*/AWSReservedSSO_AWSAdministratorAccess_*"
+            ]
+          }
+        }
+      },
+      {
+        "Sid": "ProtectCloudTrail",
+        "Effect": "Deny",
+        "Action": [
+          "cloudtrail:DeleteTrail",
+          "cloudtrail:StopLogging",
+          "cloudtrail:UpdateTrail"
+        ],
+        "Resource": "*"
+      }
+    ]
+  }

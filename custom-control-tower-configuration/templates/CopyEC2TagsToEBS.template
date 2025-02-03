@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Automate copying EC2 instance tags to attached EBS volumes.
+
+Resources:
+  CopyEC2TagsToEBSLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CopyTagsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeVolumes
+                  - ec2:CreateTags
+                Resource: "*"
+
+  CopyEC2TagsToEBSLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CopyEC2TagsToEBS
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt CopyEC2TagsToEBSLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+
+          ec2 = boto3.client('ec2')
+
+          def lambda_handler(event, context):
+              try:
+                  # Extract instance ID from the event
+                  instance_id = event['detail']['responseElements']['instancesSet']['items'][0]['instanceId']
+
+                  # Get the tags from the EC2 instance
+                  instance_details = ec2.describe_instances(InstanceIds=[instance_id])
+                  instance_tags = instance_details['Reservations'][0]['Instances'][0].get('Tags', [])
+
+                  # Filter out AWS system tags (tags that start with 'aws:')
+                  filtered_tags = [tag for tag in instance_tags if not tag['Key'].startswith('aws:')]
+
+                  # Get all attached volumes
+                  volumes = ec2.describe_volumes(Filters=[
+                      {'Name': 'attachment.instance-id', 'Values': [instance_id]}
+                  ])['Volumes']
+
+                  # Apply filtered tags to each volume
+                  for volume in volumes:
+                      volume_id = volume['VolumeId']
+                      if filtered_tags:  # Only create tags if there are tags to copy
+                          ec2.create_tags(Resources=[volume_id], Tags=filtered_tags)
+                          print(f"Copied tags to volume {volume_id}")
+
+                  return {"status": "success", "message": "Tags copied successfully"}
+              except Exception as e:
+                  print(f"Error: {e}")
+                  return {"status": "error", "message": str(e)}
+
+  CopyEC2TagsToEBSRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: CopyEC2TagsToEBSRule
+      EventPattern:
+        source:
+          - "aws.ec2"
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - "ec2.amazonaws.com"
+          eventName:
+            - "RunInstances"
+      Targets:
+        - Arn: !GetAtt CopyEC2TagsToEBSLambda.Arn
+          Id: CopyEC2TagsToEBSTarget
+
+  LambdaPermissionForEventBridge:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CopyEC2TagsToEBSLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CopyEC2TagsToEBSRule.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Description: Name of the Lambda function.
+    Value: !Ref CopyEC2TagsToEBSLambda
+  EventBridgeRuleName:
+    Description: Name of the EventBridge rule.
+    Value: !Ref CopyEC2TagsToEBSRule

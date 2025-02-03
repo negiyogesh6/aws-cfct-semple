@@ -1,0 +1,14 @@
+[
+    {
+      "ParameterKey": "BudgetAmount",
+      "ParameterValue": "5000"
+    },
+    {
+      "ParameterKey": "NotificationThresholds",
+      "ParameterValue": "80,100"
+    },
+    {
+      "ParameterKey": "EmailAddresses",
+      "ParameterValue": "emailID"
+    }
+  ]

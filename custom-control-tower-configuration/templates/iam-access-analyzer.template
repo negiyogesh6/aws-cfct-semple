@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: This template creates an organization IAM Access Analyzer and sets up delegated administrator
+
+Parameters:
+  AccessAnalyzerName:
+    Default: cfct-organization-access-analyzer
+    Description: Organization Access Analyzer Name
+    Type: String
+  DelegatedAdminAccountId:
+    Type: String
+    Description: The AWS account ID to be registered as delegated administrator for IAM Access Analyzer
+
+Resources:
+  DelegatedAdminLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AccessAnalyzerDelegatedAdmin
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:RegisterDelegatedAdministrator
+                  - organizations:DeregisterDelegatedAdministrator
+                  - organizations:ListDelegatedAdministrators
+                  - organizations:EnableAWSServiceAccess
+                  - organizations:DisableAWSServiceAccess
+                  - organizations:ListAWSServiceAccessForOrganization
+                Resource: '*'
+
+  DelegatedAdminLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt DelegatedAdminLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import logging
+          import time
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def enable_service_access(organizations, service_principal):
+              try:
+                  logger.info(f'Enabling service access for {service_principal}')
+                  organizations.enable_aws_service_access(
+                      ServicePrincipal=service_principal
+                  )
+                  # Wait for service access to be enabled
+                  time.sleep(10)
+                  return True
+              except organizations.exceptions.ServiceException as e:
+                  if 'Service access is already enabled' in str(e):
+                      logger.info(f'Service access already enabled for {service_principal}')
+                      return True
+                  raise
+
+          def handler(event, context):
+              try:
+                  logger.info('Received event: %s', event)
+                  
+                  # Initialize organizations client
+                  organizations = boto3.client('organizations')
+                  
+                  # Extract properties from the event
+                  properties = event['ResourceProperties']
+                  account_id = properties['AccountId']
+                  
+                  # Service principal for IAM Access Analyzer
+                  service_principal = 'access-analyzer.amazonaws.com'
+                  
+                  physical_id = f'AccessAnalyzerDelegatedAdmin-{account_id}'
+                  
+                  if event['RequestType'] == 'Create':
+                      try:
+                          # First enable service access
+                          enable_service_access(organizations, service_principal)
+                          
+                          logger.info(f'Registering IAM Access Analyzer delegated administrator for account {account_id}')
+                          try:
+                              organizations.register_delegated_administrator(
+                                  AccountId=account_id,
+                                  ServicePrincipal=service_principal
+                              )
+                              cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                             {'Message': f'Successfully registered IAM Access Analyzer delegated administrator for account {account_id}'},
+                                             physical_id)
+                          except organizations.exceptions.AccountAlreadyRegisteredException:
+                              logger.info(f'Account {account_id} is already registered as delegated administrator')
+                              cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                             {'Message': f'Account {account_id} was already registered as delegated administrator'},
+                                             physical_id)
+                      except Exception as e:
+                          logger.error(f'Error during registration: {str(e)}')
+                          cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                         {'Error': str(e)},
+                                         physical_id)
+                          
+                  elif event['RequestType'] == 'Update':
+                      try:
+                          # Verify service access is enabled
+                          enable_service_access(organizations, service_principal)
+                          
+                          organizations.list_delegated_administrators(
+                              ServicePrincipal=service_principal
+                          )
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                         {'Message': 'Delegated administrator registration verified'},
+                                         physical_id)
+                      except Exception as e:
+                          logger.error(f'Error during update: {str(e)}')
+                          cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                         {'Error': str(e)},
+                                         physical_id)
+                          
+                  elif event['RequestType'] == 'Delete':
+                      try:
+                          organizations.deregister_delegated_administrator(
+                              AccountId=account_id,
+                              ServicePrincipal=service_principal
+                          )
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                         {'Message': f'Successfully deregistered delegated administrator for account {account_id}'},
+                                         physical_id)
+                      except Exception as e:
+                          logger.error(f'Error during deletion: {str(e)}')
+                          cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                         {'Error': str(e)},
+                                         physical_id)
+                          
+              except Exception as e:
+                  logger.error(f'Error: {str(e)}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                 {'Error': str(e)},
+                                 physical_id if 'physical_id' in locals() else None)
+      Timeout: 300
+      MemorySize: 128
+
+  AccessAnalyzerDelegatedAdmin:
+    Type: Custom::DelegatedAdmin
+    Properties:
+      ServiceToken: !GetAtt DelegatedAdminLambda.Arn
+      AccountId: !Ref DelegatedAdminAccountId
+
+  OrganizationAccessAnalyzer:
+    Type: AWS::AccessAnalyzer::Analyzer
+    DependsOn: AccessAnalyzerDelegatedAdmin
+    Properties:
+      AnalyzerName: !Sub ${AccessAnalyzerName}
+      Tags:
+        - Key: resource
+          Value: cfct-security
+        - Key: environment
+          Value: shared
+        - Key: project
+          Value: control-tower  
+      Type: ORGANIZATION
+
+Outputs:
+  DelegatedAdminStatus:
+    Description: Status of IAM Access Analyzer delegated administrator registration
+    Value: !Ref AccessAnalyzerDelegatedAdmin
+  AccessAnalyzerArn:
+    Description: ARN of the created IAM Access Analyzer
+    Value: !GetAtt OrganizationAccessAnalyzer.Arn

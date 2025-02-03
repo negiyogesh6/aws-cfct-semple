@@ -1,0 +1,11 @@
+[
+
+    {
+        "ParameterKey": "AccessAnalyzerName",
+        "ParameterValue": "cfct-organization-access-analyzer"
+    },
+    {
+        "ParameterKey": "DelegatedAdminAccountId",
+        "ParameterValue": "111111111111"
+    }
+]

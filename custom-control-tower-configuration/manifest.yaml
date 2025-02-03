@@ -1,0 +1,96 @@
+#Default region for deploying Custom Control Tower: Code Pipeline, Step functions, Lambda, SSM parameters, and StackSets
+region: ap-southeast-1
+version: 2021-03-15
+
+# Control Tower Custom CloudFormation Resources
+resources:      
+  # IAM custom Password Policy
+  - name: iam-password-policy
+    resource_file: templates/password-policy.template
+    deploy_method: stack_set
+    deployment_targets:
+      organizational_units:
+        - Root
+    regions:
+      - ap-southeast-1
+
+  - name: custom-member-account-guardrails
+    description: To prevent from deleting or disabling resources in member accounts
+    resource_file: policies/scp-custom-member-accounts-01.json
+    deploy_method: scp
+    #Apply to the following OU(s)
+    deployment_targets:
+      # accounts property is not supported for SCPs
+      organizational_units:
+        - Sandbox
+        - Workload
+        - Core
+        - Infrastructure
+
+  - name: custom-management-account-guardrails
+    description: To prevent from deleting or disabling resources in master accounts
+    resource_file: policies/scp-custom-management-account.json
+    deploy_method: scp
+    #Apply to the following OU(s)
+    deployment_targets:
+      # accounts property is not supported for SCPs
+      organizational_units:
+        - Root
+
+  #Copy Ec2 tags to Ebs
+  - name: Copy-Ec2-Tags-To-Ebs
+    resource_file: templates/CopyEC2TagsToEBS.template
+    deploy_method: stack_set
+    deployment_targets:
+      organizational_units:
+        - Workload
+        - Workload:nestedOU
+    regions:
+      - ap-southeast-1
+
+  - name: ConfigCommonRuleset
+    resource_file: templates/common-config-rule.template
+    parameter_file: parameters/common-config-rule.json 
+    deploy_method: stack_set
+    deployment_targets:
+      organizational_units:
+        - Workload
+        - Workload:nestedOU
+    regions:
+      - ap-southeast-1 
+
+  - name: ConfigCustomRule
+    resource_file: templates/custom-config-rule.template
+    deploy_method: stack_set
+    deployment_targets:
+      organizational_units:
+        - Workload
+        - Workload:nestedOU
+    regions:
+      - ap-southeast-1 
+
+  - name: aws-budget-alert
+    resource_file: templates/budget-alert.template
+    parameter_file: parameters/budget-alert.json
+    deploy_method: stack_set
+    deployment_targets:
+      organizational_units:
+        - Sandbox
+        - Workload
+        - Workload:nestedOU
+        - Core
+        - Infrastructure
+    regions:
+      - ap-southeast-1  
+
+  - name: iam-access-analyzer
+    resource_file: templates/iam-access-analyzer.template
+    parameters:
+      - parameter_key: DelegatedAdminAccountId
+        parameter_value: 111111111111
+    deploy_method: stack_set
+    deployment_targets:
+      accounts:
+        - Master_Account_ID
+
+
